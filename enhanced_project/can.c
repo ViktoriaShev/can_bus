@@ -22,8 +22,12 @@
 
 #define MAX_PKT 8
 #define TIMEOUT_SECONDS 2
+#define FRAME_DATA_LEN 8
+#define BUFFER_SIZE 64
 
 #define MAX_IDS 128  // Максимальное количество уникальных ID
+#define MAX_TTY_LISTENERS 8
+#define TTY_QUEUE_SIZE 256
 
 typedef struct {
     uint16_t ids[MAX_IDS];
@@ -47,18 +51,43 @@ typedef struct {
     int count;
 } PrCodeModulesSet;
 
+typedef struct {
+    struct can_frame frame;
+    int fd;
+} FrameWithFD;
+
+typedef struct {
+    FrameWithFD buffer[BUFFER_SIZE];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} FrameQueue;
+
+
+
+typedef struct {
+    int fd;
+    uint16_t can_id;
+    FrameQueue* queue;
+} TTYListenerArgs;
+
+FrameQueue queue;
+FrameQueue tty_queue;
+
 static const PrCodesSet MODELS = {
     .product_code = {0x3,0x2},  // Остальные = 0 автоматически
     .count = 2
 };
 
-// Структура для передачи аргументов в поток
-typedef struct {
-    uint16_t can_id;
-    int fd;
-    const char* can_interface;
-    pthread_mutex_t* write_mutex;
-} ListenerArgs;
+// Функция сравнения (можно вынести выше)
+int compare_uint16(const void* a, const void* b) {
+    uint16_t ua = *(const uint16_t*)a;
+    uint16_t ub = *(const uint16_t*)b;
+    return (ua > ub) - (ua < ub);
+}
 
 // Проверка, содержится ли ID уже в структуре
 int idset_contains(const IDSet* set, uint16_t id) {
@@ -152,12 +181,10 @@ IDSet collect_can_ID(const char* can_interface) {
             }
         }
 
-        printf(" Данные: ");
-        for (int i = 0; i < frame.can_dlc; ++i) {
-            printf("%02X ", frame.data[i]);
-        }
-        printf("\n");
     }
+    qsort(idSet.ids, idSet.count, sizeof(uint16_t), 
+          (int (*)(const void*, const void*))compare_uint16);
+
     close(sock);
     return idSet;
 }
@@ -230,6 +257,18 @@ PrCodeCanIDSet collect_product_code(const char* can_interface, IDSet* idSet) {
 
         printf("✔ Product Code от 0x%X: 0x%08X\n", node_id, prod_code);
     }
+    for (int i = 0; i < result.count - 1; i++) {
+        for (int j = 0; j < result.count - i - 1; j++) {
+            if (result.can_id[j] > result.can_id[j + 1]) {
+                uint16_t temp_id = result.can_id[j];
+                result.can_id[j] = result.can_id[j + 1];
+                result.can_id[j + 1] = temp_id;
+                uint32_t temp_code = result.product_code[j];
+                result.product_code[j] = result.product_code[j + 1];
+                result.product_code[j + 1] = temp_code;
+            }
+        }
+    }
 
     close(sock);
     return result;
@@ -268,43 +307,98 @@ static int open_port(int n) {
 }
 
 PrCodeModulesSet open_tty(PrCodeCanIDSet* PrCodeSet) {
-    int fd[8];
-    PrCodeModulesSet result= {0};
-    for (int j = 11; j-11 < (MODELS.count - 1);j++) {
-        fd[j-11] = open_port(j);
-    }
+    PrCodeModulesSet result = {0};
 
-    for (int i=0; i< PrCodeSet->count;i++) {
-        for (int j=0; j< MODELS.count;j++) {
-            if (PrCodeSet->product_code[i] == MODELS.product_code[j]) {
-                result.can_id[i] = PrCodeSet->can_id[i];
-                result.fd[i] = fd[j];
-                result.count++;
-                printf("Собранные уникальные:\n %X, %X",PrCodeSet->product_code[i],MODELS.product_code[j]);
+    for (int i = 0; i < PrCodeSet->count; i++) {
+        uint32_t current_product_code = PrCodeSet->product_code[i];
+        uint16_t current_can_id = PrCodeSet->can_id[i];
 
+        int is_supported = 0;
+        for (int j = 0; j < MODELS.count; j++) {
+            if (current_product_code == MODELS.product_code[j]) {
+                is_supported = 1;
+                break;
             }
         }
+
+        if (!is_supported) {
+            printf("⚠ Пропущен неподдерживаемый Product Code: 0x%X (CAN ID: 0x%X)\n", current_product_code, current_can_id);
+            continue;
+        }
+
+        // Открываем отдельный порт для каждого can_id
+        
+        int tty_index = 11 + result.count; 
+        printf("Открываю порт: /dev/ttyS%d для CAN ID 0x%X\n", tty_index, current_can_id);
+        int fd = open_port(tty_index);
+        if (fd < 0) {
+            fprintf(stderr, "Не удалось открыть порт для CAN ID 0x%X\n", current_can_id);
+            continue;
+        }
+
+        result.can_id[result.count] = current_can_id;
+        result.fd[result.count] = fd;
+        result.count++;
+
+        printf("✔ Назначен fd %d для CAN ID 0x%X (Product Code 0x%X)\n", fd, current_can_id, current_product_code);
     }
+
     return result;
 }
 
-/*
-void* listen_thread(void* arg) {
-    ListenerArgs* args = (ListenerArgs*)arg;
 
-    // Создаем socket CAN и биндимся к интерфейсу
-    int sock = createCanSocket(args->can_interface);
+void queue_init(FrameQueue* q) {
+    q->head = q->tail = q->count = 0;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->not_full, NULL);
+}
+
+void queue_push(FrameQueue* q, const FrameWithFD* item) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->count == BUFFER_SIZE) {
+        pthread_cond_wait(&q->not_full, &q->mutex);
+    }
+
+    q->buffer[q->tail] = *item;
+    q->tail = (q->tail + 1) % BUFFER_SIZE;
+    q->count++;
+
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+void queue_pop(FrameQueue* q, FrameWithFD* item) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->count == 0) {
+        pthread_cond_wait(&q->not_empty, &q->mutex);
+    }
+
+    *item = q->buffer[q->head];
+    q->head = (q->head + 1) % BUFFER_SIZE;
+    q->count--;
+
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+void* listen_can(void* arg) {
+    printf("start listening...\n");
+    PrCodeModulesSet* args = (PrCodeModulesSet*)arg; 
+    int sock = create_can_socket("can0");
     if (sock < 0) {
         perror("createCanSocket в потоке");
         return NULL;
     }
 
-    // Устанавливаем фильтр на конкретный can_id
-    struct can_filter filter;
-    filter.can_id = args->can_id;
-    filter.can_mask = CAN_SFF_MASK; // фильтр по точному ID
+    struct can_filter filters[MAX_IDS];
+    for (int i = 0; i < args->count; ++i) {
+        filters[i].can_id  = args->can_id[i];
+        filters[i].can_mask = 0x7F;               // сравнивать только младшие 7 бит
+    }
 
-    if (setsockopt(sock, SOL_CAN_RAW, CAN_RAW_FILTER, &filter, sizeof(filter)) < 0) {
+    if (setsockopt(sock, SOL_CAN_RAW, CAN_RAW_FILTER,
+                   filters, sizeof(struct can_filter) * args->count) < 0) {
         perror("setsockopt filter");
         close(sock);
         return NULL;
@@ -321,16 +415,31 @@ void* listen_thread(void* arg) {
             continue;
         }
 
-        pthread_mutex_lock(args->write_mutex);
-        ssize_t written = write(args->fd, frame.data, frame.can_dlc);
-        pthread_mutex_unlock(args->write_mutex);
-
-        if (written < 0) {
-            perror("write в tty");
-            break;
+        uint16_t func_code = frame.can_id & ~0x7F;
+        if (func_code != 0x180) {
+            continue;  // Пропустить нежеланный кадр
         }
 
-        printf("CAN ID 0x%X -> tty fd %d: ", frame.can_id, args->fd);
+        FrameWithFD item;
+        item.frame = frame;
+
+        item.fd = -1;
+
+        for (int i = 0; i < args->count; ++i) {
+            if ((frame.can_id & 0x7F) == args->can_id[i] ) {
+                item.fd = args->fd[i];
+                break;
+            }
+        }
+        if (item.fd != -1 && nbytes == sizeof(struct can_frame)) {
+            queue_push(&queue, &item);
+        } else {
+            fprintf(stderr, "Не найден fd для CAN ID 0x%X\n", frame.can_id);
+        }
+    
+
+        printf("CAN ID 0x%X -> tty fd %d: ", frame.can_id, item.fd);
+
         for (int i = 0; i < frame.can_dlc; i++) {
             printf("%02X ", frame.data[i]);
         }
@@ -341,71 +450,160 @@ void* listen_thread(void* arg) {
     return NULL;
 }
 
-int listenCan(PrCodeModulesSet* PrCodeSet) {
-    pthread_t threads[MAX_IDS];
-    ListenerArgs args[MAX_IDS];
-    pthread_mutex_t fd_mutexes[MAX_IDS];
-    int used_fds[MAX_IDS] = {0};
-    int mutex_count = 0;
-    int thread_count = 0;
+void* process_data(void* arg) {
+    printf("start writing...\n");
+    FrameQueue* queue = (FrameQueue*)arg;
 
-    for (int i = 0; i < PrCodeSet->count; ++i) {
-        pthread_mutex_t* mutex = NULL;
-        for (int j = 0; j < mutex_count; ++j) {
-            if (used_fds[j] == PrCodeSet->fd[i]) {
-                mutex = &fd_mutexes[j];
-                break;
+    while (1) {
+
+        FrameWithFD item;
+        queue_pop(queue, &item);
+        printf("Обработка CAN ID 0x%X -> tty fd %d: ", item.frame.can_id, item.fd);
+        for (int i = 0; i < item.frame.can_dlc; ++i) {
+            printf("%02X ", item.frame.data[i]);
+        }
+        printf("\n");
+        unsigned char data[item.frame.can_dlc];
+
+        for (int i=0; i < item.frame.can_dlc;i++) {
+
+            data[i]=(char)item.frame.data[i];
+            printf("данные: %02X %02X %d\n", data[i],item.frame.data[i], item.fd );
+
+        }
+        if (item.fd != -1) {
+            // TODO: обработка frame.data[]
+            ssize_t written = write(item.fd, data, item.frame.can_dlc);
+            if (written < 0) {
+                perror("Ошибка записи в tty");
             }
         }
-        if (!mutex) {
-            used_fds[mutex_count] = PrCodeSet->fd[i];
-            mutex = &fd_mutexes[mutex_count];
-            pthread_mutex_init(mutex, NULL);
-            mutex_count++;
-        }
-
-        args[i].can_id = PrCodeSet->can_id[i] + 0x700;
-        args[i].fd = PrCodeSet->fd[i];
-        args[i].can_interface = CAN_INTERFACE;
-        args[i].write_mutex = mutex;
-
-        if (pthread_create(&threads[i], NULL, listen_thread, &args[i]) != 0) {
-            perror("pthread_create");
-        } else {
-            thread_count++;
-        }
     }
 
-    for (int i = 0; i < thread_count; ++i) {
-        pthread_join(threads[i], NULL);
-    }
-
-    return 0;
+    return NULL;
 }
-*/
+
+void* tty_listener_thread(void* arg) {
+    TTYListenerArgs* args = (TTYListenerArgs*)arg;
+    printf("TTY(fd=%d, CAN ID=0x%X) -> Queue: %d bytes\n", args->fd, args->can_id);
+    while (1) {
+        uint8_t buf[8];
+        ssize_t len = read(args->fd, buf, sizeof(buf));
+        printf("READ %zd bytes from fd %d\n", len, args->fd);
+        if (len <= 0) continue;
+
+        FrameWithFD frame = {
+            .fd = args->fd,
+            .frame = {0}
+        };
+        frame.frame.can_id = args->can_id;
+        frame.frame.can_dlc = len;
+        memcpy(frame.frame.data, buf, len);
+
+        queue_push(args->queue, &frame);
+
+        printf("TTY(fd=%d, CAN ID=0x%X) -> Queue: %d bytes\n", args->fd, args->can_id, (int)len);
+    }
+
+    return NULL;
+}
+
+void* tty_to_can_thread(void* arg) {
+    FrameQueue* queue = (FrameQueue*)arg;
+    int sock = create_can_socket("can0");
+    if (sock < 0) {
+        perror("CAN socket");
+        return NULL;
+    }
+
+    while (1) {
+        FrameWithFD item;
+        queue_pop(queue, &item);
+
+        struct can_frame frame = {0};
+        frame.can_id = 0x200 + item.frame.can_id;
+        frame.can_dlc = item.frame.can_dlc;
+        memcpy(frame.data, item.frame.data, frame.can_dlc);
+        printf("Sending to CAN bus: ID=0x%X, DLC=%d, Data=", frame.can_id, frame.can_dlc);
+        for (int i = 0; i < frame.can_dlc; ++i) {
+            printf("%02X ", frame.data[i]);
+        }
+        printf("\n");
+
+        if (write(sock, &frame, sizeof(frame)) < 0) {
+            perror("CAN write");
+        } else {
+            printf("Queue -> CAN(0x%X): %d bytes\n", frame.can_id, frame.can_dlc);
+        }
+    }
+
+    close(sock);
+    return NULL;
+}
+
 int main() {
     const char* can_interface = "can0";
+    queue_init(&queue);
+    queue_init(&tty_queue);
 
     IDSet idSet = collect_can_ID(can_interface);
 
     printf("Собранные уникальные CAN ID:\n");
-    for (int i = 0; i < idSet.count; ++i) {
+    for (int i = 0; i < idSet.count; i++) {
         printf(" - 0x%X\n", idSet.ids[i]);
     }
 
     PrCodeCanIDSet prCodeSet = collect_product_code(can_interface, &idSet);
     printf("Собранные уникальные  product code + can_id:\n");
-    for (int i = 0; i < prCodeSet.count; ++i) {
+    for (int i = 0; i < prCodeSet.count; i++) {
         printf(" - 0x%X", prCodeSet.product_code[i]);
         printf(" - 0x%X\n", prCodeSet.can_id[i]);
     }
 
     PrCodeModulesSet prCodeModulesSet = open_tty(&prCodeSet);
     printf("Собранные уникальные fd + can_id: %d\n", prCodeModulesSet.count);
-    for (int i = 0; i < prCodeModulesSet.count; ++i) {
+    for (int i = 0; i < prCodeModulesSet.count; i++) {
         printf(" fd- 0x%d", prCodeModulesSet.fd[i]);
         printf(" - 0x%X\n", prCodeModulesSet.can_id[i]);
     }
+    printf("creating threads:\n");
+    pthread_t listener_thread, processor_thread;
+    printf("creating threads:\n");
+    int res1 = pthread_create(&listener_thread, NULL, listen_can, &prCodeModulesSet);
+    int res2 = pthread_create(&processor_thread, NULL, process_data, &queue);
+    
+    if (res1 != 0) {
+        fprintf(stderr, "Ошибка запуска потока listen_can: %s\n", strerror(res1));
+    }
+    if (res2 != 0) {
+        fprintf(stderr, "Ошибка запуска потока process_data: %s\n", strerror(res2));
+    }
+
+    pthread_t tty_threads[MAX_TTY_LISTENERS];
+    TTYListenerArgs tty_args[MAX_TTY_LISTENERS];
+
+    for (int i = 0; i < prCodeModulesSet.count; i++) {
+        tty_args[i].fd = prCodeModulesSet.fd[i];
+        tty_args[i].can_id = prCodeModulesSet.can_id[i];
+        tty_args[i].queue = &tty_queue;
+
+        pthread_create(&tty_threads[i], NULL, tty_listener_thread, &tty_args[i]);
+        printf(" TTY listener thread запущен для fd=%d (CAN ID=0x%X)\n",
+            tty_args[i].fd, tty_args[i].can_id);
+    }
+
+    pthread_t tty_to_can_thread_id;
+    pthread_create(&tty_to_can_thread_id, NULL, tty_to_can_thread, &tty_queue);
+    for (int i = 0; i < prCodeModulesSet.count; i++) {
+        printf("TTY /dev/ttyS%d: fd=%d, can_id=0x%X\n", 11 + i, prCodeModulesSet.fd[i], prCodeModulesSet.can_id[i]);
+    }
+
+    pthread_join(listener_thread, NULL);
+    pthread_join(processor_thread, NULL);
+    for (int i = 0; i < prCodeModulesSet.count; ++i)
+        pthread_join(tty_threads[i], NULL);
+
+    pthread_join(tty_to_can_thread_id, NULL);
 
     return 0;
 }
